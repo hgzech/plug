@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#111">
+<title>Plug</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; }
+  body { background: #111; color: #eee; font: 18px/1.4 -apple-system, system-ui, sans-serif;
+         display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1.5rem;
+         padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom); box-sizing: border-box;
+         -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #status { display: flex; align-items: center; gap: .5rem; color: #aaa; font-size: 1rem; }
+  #dot { width: 14px; height: 14px; border-radius: 50%; background: #666; }
+  #dot.on { background: #3c3; } #dot.off { background: #d33; }
+  #toggle { width: min(70vw, 300px); height: min(70vw, 300px); border-radius: 50%; border: 0;
+            font: 600 2.2rem -apple-system, system-ui, sans-serif; color: #fff; background: #333;
+            box-shadow: 0 0 0 6px #222; touch-action: manipulation; }
+  #toggle.is-on { background: #e8a317; color: #111; box-shadow: 0 0 40px #e8a31788; }
+  #toggle.pending { opacity: .6; }
+  #toggle:active { transform: scale(.97); }
+  #sub { min-height: 1.4em; color: #aaa; }
+  .btn { font-size: 1.1rem; padding: 1rem 2rem; border-radius: 12px; border: 0; background: #2a6df4; color: #fff; }
+  #signout { background: none; color: #777; font-size: .9rem; border: 0; padding: .8rem; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div id="status"><span id="dot"></span><span id="online">…</span></div>
+<button id="signin" class="btn" hidden>Sign in with Google</button>
+<button id="toggle" hidden>…</button>
+<div id="sub"></div>
+<button id="signout" hidden>Sign out</button>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
+import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged }
+  from "https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
+import { getDatabase, ref, set, onValue, serverTimestamp }
+  from "https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyBlOlfmPbzm5fyTPtsASnBwFhWTRJ816Ac",
+  authDomain: "ikea-plug-bridge-hz.firebaseapp.com",
+  databaseURL: "https://ikea-plug-bridge-hz-default-rtdb.firebaseio.com",
+  projectId: "ikea-plug-bridge-hz",
+  storageBucket: "ikea-plug-bridge-hz.firebasestorage.app",
+  messagingSenderId: "98941497958",
+  appId: "1:98941497958:web:c10640d0b2a0ac42fcf3a7"
+};
+const STALE_MS = 90000;
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getDatabase(app);
+const $ = (id) => document.getElementById(id);
+
+let actual = null, desired = null, heartbeat = null, offset = 0, unsubs = [];
+
+function render() {
+  const t = $("toggle");
+  if (actual) {
+    const pending = desired && desired.on !== actual.on;
+    t.textContent = actual.on ? "ON" : "OFF";
+    t.classList.toggle("is-on", actual.on);
+    t.classList.toggle("pending", pending);
+    $("sub").textContent = pending ? `switching ${desired.on ? "on" : "off"}…` : "";
+  } else { t.textContent = "…"; }
+  const age = heartbeat == null ? Infinity : Date.now() + offset - heartbeat;
+  const up = age < STALE_MS;
+  $("dot").className = heartbeat == null ? "" : up ? "on" : "off";
+  $("online").textContent = heartbeat == null ? "…" : up ? "bridge online" : "bridge offline";
+}
+setInterval(render, 5000);
+
+$("signin").onclick = () => signInWithPopup(auth, new GoogleAuthProvider())
+  .catch(e => { $("sub").textContent = "Sign-in failed: " + e.code; });
+$("signout").onclick = () => signOut(auth);
+$("toggle").onclick = () => {
+  if (!actual) return;
+  set(ref(db, "plug/desired"), { on: !actual.on, ts: serverTimestamp() })
+    .catch(e => { $("sub").textContent = "Write failed: " + e.message; });
+};
+
+onValue(ref(db, ".info/serverTimeOffset"), s => { offset = s.val() || 0; render(); });
+onAuthStateChanged(auth, (u) => {
+  unsubs.forEach(f => f()); unsubs = [];
+  $("signin").hidden = !!u; $("toggle").hidden = !u; $("signout").hidden = !u;
+  if (!u) { $("sub").textContent = ""; return; }
+  unsubs.push(
+    onValue(ref(db, "plug/actual"),    s => { actual = s.val(); render(); }),
+    onValue(ref(db, "plug/desired"),   s => { desired = s.val(); render(); }),
+    onValue(ref(db, "plug/heartbeat"), s => { heartbeat = s.val(); render(); }),
+  );
+});
+</script>
+</body>
+</html>
