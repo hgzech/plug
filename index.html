@@ -117,7 +117,7 @@ $("toggle").onclick = () => {
   lastTap = { cts, on };
   plog("tap", `on=${on} connected=${connected} zigbee_ok=${actual.zigbee_ok} visible=${!document.hidden}`);
   set(ref(db, "plug/desired"), { on, ts: serverTimestamp(), client_ts: Math.round(cts + offset) })
-    .then(() => plog("write_ack", `on=${on} acked ${Date.now() - cts} ms after tap`))
+    .then(() => plog("write_ack", `on=${on} acked ${Date.now() - cts} ms after tap ack=${Date.now() - cts}ms`))
     .catch(e => { $("sub").textContent = "Write failed: " + e.message; plog("write_err", e.message); });
   render();
 };
@@ -172,7 +172,11 @@ onAuthStateChanged(auth, (u) => {
   unsubs.push(
     onValue(ref(db, "plug/actual"), s => {
       actual = s.val();
-      if (lastTap && actual && actual.on === lastTap.on) { plog("seen_state", `on=${actual.on} ${Date.now() - lastTap.cts} ms after tap`); lastTap = null; }
+      if (lastTap && actual && actual.on === lastTap.on) {
+        const fbPhone = actual.ts ? Math.round(Date.now() + offset - actual.ts) : -1;   // /plug/actual written -> seen here
+        plog("seen_state", `on=${actual.on} ${Date.now() - lastTap.cts} ms after tap fb>phone=${fbPhone}ms`);
+        lastTap = null;
+      }
       render();
     }),
     onValue(ref(db, "plug/desired"),   s => { desired = s.val(); render(); }),
