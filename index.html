@@ -67,6 +67,8 @@ const $ = (id) => document.getElementById(id);
 let actual = null, desired = null, heartbeat = null, offset = 0, unsubs = [];
 let connected = null, everConnected = false;   // Firebase connection of THIS page (.info/connected)
 let lastTap = null;                            // { cts, on } of the last tap, until the new state is seen
+const LOCK_MS = 3000;                          // button ignores taps until the last tap's state is seen (max 3 s)
+const locked = () => !!lastTap && Date.now() - lastTap.cts < LOCK_MS;
 const DEBUG = new URLSearchParams(location.search).has("debug");
 if (DEBUG) { document.body.classList.add("debug"); $("dbg").hidden = false; }
 
@@ -85,7 +87,7 @@ function render() {
     const pending = desired && desired.on !== actual.on;
     t.textContent = actual.on ? "ON" : "OFF";
     t.classList.toggle("is-on", actual.on);
-    t.classList.toggle("pending", pending || actual.zigbee_ok === false);
+    t.classList.toggle("pending", pending || locked() || actual.zigbee_ok === false);
     let sub = "";
     if (pending) {
       sub = `switching ${desired.on ? "on" : "off"}…`;
@@ -113,6 +115,7 @@ $("signin").onclick = () => signInWithPopup(auth, new GoogleAuthProvider())
 $("signout").onclick = () => signOut(auth);
 $("toggle").onclick = () => {
   if (!actual) return;
+  if (locked()) { plog("tap_ignored", `still switching (${Date.now() - lastTap.cts} ms after last tap)`); return; }
   const on = !actual.on, cts = Date.now();
   lastTap = { cts, on };
   plog("tap", `on=${on} connected=${connected} zigbee_ok=${actual.zigbee_ok} visible=${!document.hidden}`);
@@ -120,6 +123,7 @@ $("toggle").onclick = () => {
     .then(() => plog("write_ack", `on=${on} acked ${Date.now() - cts} ms after tap ack=${Date.now() - cts}ms`))
     .catch(e => { $("sub").textContent = "Write failed: " + e.message; plog("write_err", e.message); });
   render();
+  setTimeout(render, LOCK_MS + 50);   // un-grey if no answer came within the lock time
 };
 
 onValue(ref(db, ".info/serverTimeOffset"), s => { offset = s.val() || 0; render(); });
