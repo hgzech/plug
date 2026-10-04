@@ -20,7 +20,12 @@
             font: 600 2.2rem -apple-system, system-ui, sans-serif; color: #fff; background: #333;
             box-shadow: 0 0 0 6px #222; touch-action: manipulation; }
   #toggle.is-on { background: #e8a317; color: #111; box-shadow: 0 0 40px #e8a31788; }
-  #toggle.pending { opacity: .6; }
+  #toggle { position: relative; }
+  #toggle.dim { opacity: .6; }                     /* plug unreachable / bridge offline only, never for a normal tap */
+  #toggle.waiting::after { content: ""; position: absolute; inset: -12px; border-radius: 50%;
+            border: 3px solid transparent; border-top-color: #e8a317; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #warn.fail { color: #ff6b5b; }
   #toggle:active { transform: scale(.97); }
   #sub { min-height: 1.4em; color: #aaa; }
   .btn { font-size: 1.1rem; padding: 1rem 2rem; border-radius: 12px; border: 0; background: #2a6df4; color: #fff; }
@@ -69,6 +74,14 @@ let connected = null, everConnected = false;   // Firebase connection of THIS pa
 let lastTap = null;                            // { cts, on } of the last tap, until the new state is seen
 const LOCK_MS = 3000;                          // button ignores taps until the last tap's state is seen (max 3 s)
 const locked = () => !!lastTap && Date.now() - lastTap.cts < LOCK_MS;
+// Command validity (BRIEFING -> Command validity): the bridge switches the plug within 10 s of the tap or never.
+// The page shows the new state FLIP_DELAY_MS after the tap (≈ when the light switches), shows a ring after RING_MS
+// without confirmation, and gives a definite "not switched" when the bridge discards the tap (it resets
+// /plug/desired to the actual state, without client_ts) or after FAIL_MS with no answer at all.
+const FLIP_DELAY_MS = 250;                     // tune to the measured median tap>light
+const RING_MS = 1500;
+const FAIL_MS = 15000;                         // 10 s validity + C6 answer time (~3 s) + margin
+let failMsg = "";                              // last "not switched" message, shown until the next tap
 const DEBUG = new URLSearchParams(location.search).has("debug");
 if (DEBUG) { document.body.classList.add("debug"); $("dbg").hidden = false; }
 
@@ -80,33 +93,42 @@ function plog(ev, msg = "") {
     .catch(() => {});
 }
 
+function failTap(why) {
+  plog("tap_failed", `on=${lastTap.on} ${Date.now() - lastTap.cts} ms after tap: ${why}`);
+  failMsg = `Not switched ${lastTap.on ? "on" : "off"}: ${why}`;
+  lastTap = null;
+}
+
 function render() {
   const t = $("toggle");
   let warn = "";
+  if (lastTap && Date.now() - lastTap.cts > FAIL_MS) failTap("no answer from the bridge within 10 s. The tap was discarded.");
   if (actual) {
-    const pending = desired && desired.on !== actual.on;
-    t.textContent = actual.on ? "ON" : "OFF";
-    t.classList.toggle("is-on", actual.on);
-    t.classList.toggle("pending", pending || locked() || actual.zigbee_ok === false);
+    const since = lastTap ? Date.now() - lastTap.cts : 0;
+    const shown = lastTap && since >= FLIP_DELAY_MS ? lastTap.on : actual.on;   // optimistic, after the flip delay
+    t.textContent = shown ? "ON" : "OFF";
+    t.classList.toggle("is-on", shown);
+    t.classList.toggle("waiting", !!lastTap && since >= RING_MS);
+    t.classList.toggle("dim", !lastTap && actual.zigbee_ok === false);
     let sub = "";
-    if (pending) {
-      sub = `switching ${desired.on ? "on" : "off"}…`;
-      if (lastTap) sub += ` (${Math.round((Date.now() - lastTap.cts) / 1000)} s)`;
-    }
+    if (lastTap && since >= RING_MS) sub = `waiting for the plug… ${Math.round(since / 1000)} s`;
+    else if (!lastTap && desired && desired.on !== actual.on) sub = `switching ${desired.on ? "on" : "off"}…`;   // from elsewhere
     $("sub").textContent = sub;
-    if (actual.zigbee_ok === false) warn = "Plug unreachable: the bridge can't reach the plug right now. Commands wait until it's back.";
+    if (actual.zigbee_ok === false) warn = "Plug unreachable: the bridge can't reach the plug right now. A tap is discarded if it can't be done within 10 s.";
   } else { t.textContent = "…"; }
   const age = heartbeat == null ? Infinity : Date.now() + offset - heartbeat;
   const up = age < STALE_MS;
   if (connected === false && everConnected) {
     $("dot").className = "wait";
     $("online").textContent = "phone offline – reconnecting…";
-    warn = "This page lost its connection. Taps are queued and sent when it reconnects.";
+    warn = "This page lost its connection. A tap made now only counts if it reaches the bridge within 10 s.";
   } else {
     $("dot").className = heartbeat == null ? "" : up ? "on" : "off";
     $("online").textContent = heartbeat == null ? "…" : up ? "bridge online" : "bridge offline";
   }
+  if (failMsg) warn = failMsg;
   $("warn").textContent = warn;
+  $("warn").classList.toggle("fail", !!failMsg);
 }
 setInterval(render, 1000);
 
@@ -116,14 +138,16 @@ $("signout").onclick = () => signOut(auth);
 $("toggle").onclick = () => {
   if (!actual) return;
   if (locked()) { plog("tap_ignored", `still switching (${Date.now() - lastTap.cts} ms after last tap)`); return; }
-  const on = !actual.on, cts = Date.now();
-  lastTap = { cts, on };
+  const on = lastTap ? !lastTap.on : !actual.on, cts = Date.now();   // toggle what the button shows
+  lastTap = { cts, on }; failMsg = "";
   plog("tap", `on=${on} connected=${connected} zigbee_ok=${actual.zigbee_ok} visible=${!document.hidden}`);
   set(ref(db, "plug/desired"), { on, ts: serverTimestamp(), client_ts: Math.round(cts + offset) })
     .then(() => plog("write_ack", `on=${on} acked ${Date.now() - cts} ms after tap ack=${Date.now() - cts}ms`))
     .catch(e => { $("sub").textContent = "Write failed: " + e.message; plog("write_err", e.message); });
+  if (on === actual.on) lastTap = null;   // superseding tap back to the plug's current state: nothing to wait for
   render();
-  setTimeout(render, LOCK_MS + 50);   // un-grey if no answer came within the lock time
+  setTimeout(render, FLIP_DELAY_MS);   // flip the button about when the light switches
+  setTimeout(render, RING_MS + 20);
 };
 
 onValue(ref(db, ".info/serverTimeOffset"), s => { offset = s.val() || 0; render(); });
@@ -183,7 +207,13 @@ onAuthStateChanged(auth, (u) => {
       }
       render();
     }),
-    onValue(ref(db, "plug/desired"),   s => { desired = s.val(); render(); }),
+    onValue(ref(db, "plug/desired"),   s => {
+      desired = s.val();
+      // the bridge discarded our tap: it reset desired to the actual state (its writes carry no client_ts)
+      if (lastTap && desired && desired.client_ts == null && desired.on !== lastTap.on && actual && actual.on !== lastTap.on)
+        failTap(actual.zigbee_ok === false ? "the bridge couldn't reach the plug within 10 s." : "the plug didn't switch within 10 s. The tap was discarded.");
+      render();
+    }),
     onValue(ref(db, "plug/heartbeat"), s => { heartbeat = s.val(); render(); }),
   );
   if (DEBUG) unsubs.push(
