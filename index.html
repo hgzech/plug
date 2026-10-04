@@ -25,6 +25,12 @@
   #sub { min-height: 1.4em; color: #aaa; }
   .btn { font-size: 1.1rem; padding: 1rem 2rem; border-radius: 12px; border: 0; background: #2a6df4; color: #fff; }
   #signout { background: none; color: #777; font-size: .9rem; border: 0; padding: .8rem; }
+  #warn { min-height: 1.4em; color: #f0a040; text-align: center; }
+  #dot.wait { background: #888; }
+  body.debug { justify-content: flex-start; height: auto; min-height: 100%; padding-top: 1.5rem; }
+  #dbg { width: 100%; max-width: 900px; font: 11px/1.35 ui-monospace, Menlo, monospace; color: #bbb;
+         white-space: pre-wrap; word-break: break-word; background: #1a1a1a; padding: 8px; border-radius: 8px;
+         box-sizing: border-box; -webkit-user-select: text; user-select: text; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -33,12 +39,14 @@
 <button id="signin" class="btn" hidden>Sign in with Google</button>
 <button id="toggle" hidden>…</button>
 <div id="sub"></div>
+<div id="warn"></div>
 <button id="signout" hidden>Sign out</button>
+<pre id="dbg" hidden></pre>
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
 import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged }
   from "https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
-import { getDatabase, ref, set, onValue, serverTimestamp }
+import { getDatabase, ref, set, push, update, get, onValue, serverTimestamp }
   from "https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js";
 
 const firebaseConfig = {
@@ -57,41 +65,123 @@ const db = getDatabase(app);
 const $ = (id) => document.getElementById(id);
 
 let actual = null, desired = null, heartbeat = null, offset = 0, unsubs = [];
+let connected = null, everConnected = false;   // Firebase connection of THIS page (.info/connected)
+let lastTap = null;                            // { cts, on } of the last tap, until the new state is seen
+const DEBUG = new URLSearchParams(location.search).has("debug");
+if (DEBUG) { document.body.classList.add("debug"); $("dbg").hidden = false; }
+
+// ---- phone-side event log (/plug/phonelog): cts = phone clock, off = server offset, ts = server time on arrival.
+// A write queued by the SDK while offline gets its ts only when it reaches Firebase: ts - (cts + off) = time held on the phone.
+function plog(ev, msg = "") {
+  if (!auth.currentUser) return;
+  push(ref(db, "plug/phonelog"), { ts: serverTimestamp(), cts: Date.now(), off: Math.round(offset), ev, msg: String(msg).slice(0, 200) })
+    .catch(() => {});
+}
 
 function render() {
   const t = $("toggle");
+  let warn = "";
   if (actual) {
     const pending = desired && desired.on !== actual.on;
     t.textContent = actual.on ? "ON" : "OFF";
     t.classList.toggle("is-on", actual.on);
-    t.classList.toggle("pending", pending);
-    $("sub").textContent = pending ? `switching ${desired.on ? "on" : "off"}…` : "";
+    t.classList.toggle("pending", pending || actual.zigbee_ok === false);
+    let sub = "";
+    if (pending) {
+      sub = `switching ${desired.on ? "on" : "off"}…`;
+      if (lastTap) sub += ` (${Math.round((Date.now() - lastTap.cts) / 1000)} s)`;
+    }
+    $("sub").textContent = sub;
+    if (actual.zigbee_ok === false) warn = "Plug unreachable: the bridge can't reach the plug right now. Commands wait until it's back.";
   } else { t.textContent = "…"; }
   const age = heartbeat == null ? Infinity : Date.now() + offset - heartbeat;
   const up = age < STALE_MS;
-  $("dot").className = heartbeat == null ? "" : up ? "on" : "off";
-  $("online").textContent = heartbeat == null ? "…" : up ? "bridge online" : "bridge offline";
+  if (connected === false && everConnected) {
+    $("dot").className = "wait";
+    $("online").textContent = "phone offline – reconnecting…";
+    warn = "This page lost its connection. Taps are queued and sent when it reconnects.";
+  } else {
+    $("dot").className = heartbeat == null ? "" : up ? "on" : "off";
+    $("online").textContent = heartbeat == null ? "…" : up ? "bridge online" : "bridge offline";
+  }
+  $("warn").textContent = warn;
 }
-setInterval(render, 5000);
+setInterval(render, 1000);
 
 $("signin").onclick = () => signInWithPopup(auth, new GoogleAuthProvider())
   .catch(e => { $("sub").textContent = "Sign-in failed: " + e.code; });
 $("signout").onclick = () => signOut(auth);
 $("toggle").onclick = () => {
   if (!actual) return;
-  set(ref(db, "plug/desired"), { on: !actual.on, ts: serverTimestamp() })
-    .catch(e => { $("sub").textContent = "Write failed: " + e.message; });
+  const on = !actual.on, cts = Date.now();
+  lastTap = { cts, on };
+  plog("tap", `on=${on} connected=${connected} zigbee_ok=${actual.zigbee_ok} visible=${!document.hidden}`);
+  set(ref(db, "plug/desired"), { on, ts: serverTimestamp(), client_ts: Math.round(cts + offset) })
+    .then(() => plog("write_ack", `on=${on} acked ${Date.now() - cts} ms after tap`))
+    .catch(e => { $("sub").textContent = "Write failed: " + e.message; plog("write_err", e.message); });
+  render();
 };
 
 onValue(ref(db, ".info/serverTimeOffset"), s => { offset = s.val() || 0; render(); });
+onValue(ref(db, ".info/connected"), s => {
+  const c = s.val() === true;
+  if (c !== connected && (c || everConnected)) plog(c ? "connected" : "disconnected", `visible=${!document.hidden}`);
+  connected = c; if (c) everConnected = true;
+  render();
+});
+document.addEventListener("visibilitychange", () => plog(document.hidden ? "hidden" : "visible", `connected=${connected}`));
+window.addEventListener("pageshow", e => { if (e.persisted) plog("pageshow", "restored from bfcache"); });
+
+function trimPhonelog() {   // keep the newest 200 entries
+  get(ref(db, "plug/phonelog")).then(s => {
+    const keys = Object.keys(s.val() || {}).sort();
+    if (keys.length <= 300) return;
+    const u = {}; keys.slice(0, keys.length - 200).forEach(k => u[k] = null);
+    return update(ref(db, "plug/phonelog"), u);
+  }).catch(() => {});
+}
+
+// ---- ?debug: merged bridge + phone event log, newest first
+let dbgLog = {}, dbgPhone = {}, dbgDiag = null;
+const hms = t => new Date(t).toLocaleTimeString([], { hour12: false }) + "." + String(Math.floor(t % 1000)).padStart(3, "0").slice(0, 1);
+function renderDebug() {
+  const rows = [];
+  for (const e of Object.values(dbgLog || {})) if (e && e.ts) rows.push({ t: e.ts - (e.lag || 0), src: "B", ev: e.ev, msg: (e.msg || "") + (e.lag > 5000 ? ` [sent ${Math.round(e.lag / 1000)} s later]` : "") });
+  for (const e of Object.values(dbgPhone || {})) if (e && e.cts) {
+    const t = e.cts + (e.off || 0), held = (e.ts || t) - t;
+    rows.push({ t, src: "P", ev: e.ev, msg: (e.msg || "") + (held > 3000 ? ` [reached Firebase ${Math.round(held / 1000)} s later]` : "") });
+  }
+  rows.sort((a, b) => b.t - a.t);
+  let out = "";
+  if (dbgDiag) {
+    const d = dbgDiag;
+    out += `diag (${Math.round((Date.now() + offset - d.ts) / 1000)} s ago): ${d.fw} boot#${d.boot} reset=${d.reset} up=${Math.round(d.up / 60)} min rssi=${d.rssi}\n` +
+           `  zigbee_ok=${d.zigbee_ok} c6_reboots=${d.c6_reboots} c6_reset=${d.c6_reset} wifi_drops=${d.wifi_drops} stream_restarts=${d.stream_restarts} fb_errors=${d.fb_errors} heap_min=${d.heap_min}\n\n`;
+  } else out += "diag: none yet (old bridge firmware?)\n\n";
+  out += "B = bridge, P = phone; newest first\n";
+  out += rows.slice(0, 60).map(r => `${hms(r.t)} ${r.src} ${r.ev.padEnd(13)} ${r.msg}`).join("\n");
+  $("dbg").textContent = out;
+}
+
 onAuthStateChanged(auth, (u) => {
   unsubs.forEach(f => f()); unsubs = [];
   $("signin").hidden = !!u; $("toggle").hidden = !u; $("signout").hidden = !u;
   if (!u) { $("sub").textContent = ""; return; }
+  plog("load", `${navigator.standalone ? "home-screen app" : "browser"}; ${navigator.userAgent.slice(0, 120)}`);
+  trimPhonelog();
   unsubs.push(
-    onValue(ref(db, "plug/actual"),    s => { actual = s.val(); render(); }),
+    onValue(ref(db, "plug/actual"), s => {
+      actual = s.val();
+      if (lastTap && actual && actual.on === lastTap.on) { plog("seen_state", `on=${actual.on} ${Date.now() - lastTap.cts} ms after tap`); lastTap = null; }
+      render();
+    }),
     onValue(ref(db, "plug/desired"),   s => { desired = s.val(); render(); }),
     onValue(ref(db, "plug/heartbeat"), s => { heartbeat = s.val(); render(); }),
+  );
+  if (DEBUG) unsubs.push(
+    onValue(ref(db, "plug/log"),      s => { dbgLog = s.val(); renderDebug(); }),
+    onValue(ref(db, "plug/phonelog"), s => { dbgPhone = s.val(); renderDebug(); }),
+    onValue(ref(db, "plug/diag"),     s => { dbgDiag = s.val(); renderDebug(); }),
   );
 });
 </script>
